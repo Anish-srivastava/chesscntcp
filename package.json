@@ -18,6 +18,9 @@
     "rxfire": "^4.0.0",
     "rxjs": "^6.6.7"
   },
+  
+
+
   "scripts": {
     "start": "react-scripts start",
     "build": "react-scripts build",
@@ -26,6 +29,9 @@
   },
   "eslintConfig": {
     "extends": "react-app"
+  },
+  "engines": {
+    "node": "22.x"
   },
   "browserslist": {
     "production": [
