@@ -16,7 +16,7 @@
     "react-router-dom": "^5.2.0",
     "react-scripts": "3.4.3",
     "rxfire": "^4.0.0",
-    "rxjs": "^7.1.0"
+    "rxjs": "^6.6.7"
   },
   "scripts": {
     "start": "set NODE_OPTIONS=--openssl-legacy-provider && react-scripts start",
