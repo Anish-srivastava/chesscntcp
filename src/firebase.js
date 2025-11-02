@@ -7,13 +7,13 @@ import "firebase/auth";
 
 const config = {
 
-  apiKey: "AIzaSyDBIzHwrLiGJrHhQMEb_OfPe-GIj80177U",
-  authDomain: "react-chess-p.firebaseapp.com",
-  projectId: "react-chess-p",
-  storageBucket: "react-chess-p.firebasestorage.app",
-  messagingSenderId: "558131771571",
-  appId: "1:558131771571:web:a273d889b5db82d3d858c6",
-  measurementId: "G-D4R1SS7YK1"
+  apiKey: "AIzaSyCM-n5j12-j9lJRX2Z1uUxlxqhm6vzDrAw",
+  authDomain: "cntp-d3a80.firebaseapp.com",
+  projectId: "cntp-d3a80",
+  storageBucket: "cntp-d3a80.firebasestorage.app",
+  messagingSenderId: "667067043269",
+  appId: "1:667067043269:web:85be737790b95fd11c0fac",
+  measurementId: "G-FW4EBEWJQ6"
 };
 
 const firebaseConfig = config;
