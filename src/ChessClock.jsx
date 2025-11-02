@@ -1,449 +1,468 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
+import './ChessClock.css'
 
-// Utility: safe parse int from localStorage
+/*
+  Revised ChessClock
+  - Keeps independent countdowns for White and Black (ms precision)
+  - Only the owning client (see `localPlayer` prop) ticks the active clock
+  - Supports local multi-tab mode (basic owner election using session/tab id)
+  - Supports remote mode via `gameRef` (Firestore doc) with snapshot updates
+  - Exposes `onTimeOut(loserColor)` callback when a clock reaches zero
+  - Supports `perspective` prop to render top/bottom clock order
+
+  Props (keeps compatibility with earlier interface but clarifies behavior):
+    - gameStarted (bool)     : whether the game has started
+    - currentPlayer ('w'|'b'): authoritative turn value when available (from Game.js)
+    - isGameOver (bool)      : whether the game is finished (stops clocks)
+    - onTimeOut(fn)          : called with 'w' or 'b' when a player's time runs out
+    - isLocal (bool)         : whether we run in local multi-tab mode (uses localStorage)
+    - localPlayer ('w'|'b')  : which side this client controls (if any). When set, only this
+                               client will decrement the active clock for its side.
+    - initialTimeMinutes     : initial minutes per player (fallback)
+    - gameId (string)        : used as localStorage key prefix
+    - gameRef                : optional Firebase doc ref for remote games (v8 style .onSnapshot/.update)
+    - canSetInitial, onSetInitial: UI helpers for pre-start time selection (kept for compatibility)
+    - perspective ('white'|'black'): which side is shown on the bottom for this client
+*/
+
+const SYNC_INTERVAL = 100 // ms between sync writes to storage/Firebase
+const LOW_TIME_THRESHOLD = 30 * 1000 // 30s, for low-time UI if desired
+
+// simple localStorage helpers
 const readMs = (key) => {
-  const v = localStorage.getItem(key)
-  return v ? parseInt(v, 10) : null
-}
-
-const writeMs = (key, val) => {
   try {
-    localStorage.setItem(key, String(val))
+    const v = localStorage.getItem(key)
+    return v == null ? null : parseInt(v, 10)
   } catch (e) {
-    // ignore quota issues
+    return null
   }
 }
+const writeMs = (key, v) => {
+  try { localStorage.setItem(key, String(v)) } catch (e) {}
+}
 
-const ChessClock = ({ gameStarted, currentPlayer, isGameOver, onTimeOut, isLocal = false, localPlayer = null, initialTimeMinutes = null, gameId = 'local', gameRef = null, canSetInitial = false, onSetInitial = null }) => {
-  const [timeInput, setTimeInput] = useState(initialTimeMinutes) // minutes
+export default function ChessClock({
+  gameStarted,
+  currentPlayer,
+  isGameOver,
+  onTimeOut = () => {},
+  isLocal = false,
+  localPlayer = null,
+  initialTimeMinutes = 5,
+  gameId = 'local',
+  gameRef = null,
+  canSetInitial = false,
+  onSetInitial = null,
+  perspective = 'white'
+}) {
+  // state shown to UI
   const [whiteTime, setWhiteTime] = useState(null)
   const [blackTime, setBlackTime] = useState(null)
+  const [syncedCurrent, setSyncedCurrent] = useState(currentPlayer || 'w')
 
-  // For local multi-tab sync: subscribed current turn (can come from localStorage)
-  const [syncedCurrent, setSyncedCurrent] = useState(currentPlayer)
-
-  const intervalRef = useRef(null)
-  // Use refs to store time values to avoid recreating interval on every update
-  const whiteTimeRef = useRef(null)
-  const blackTimeRef = useRef(null)
+  // refs for accurate timing without re-subscribing
+  const rafRef = useRef(null)
+  const lastTsRef = useRef(null)
+  const lastSyncRef = useRef(0)
+  const whiteRef = useRef(null)
+  const blackRef = useRef(null)
   const onTimeOutRef = useRef(onTimeOut)
   const gameRefRef = useRef(gameRef)
-  
-  // Keep refs in sync
-  useEffect(() => {
-    whiteTimeRef.current = whiteTime
-    blackTimeRef.current = blackTime
-    onTimeOutRef.current = onTimeOut
-    gameRefRef.current = gameRef
-  }, [whiteTime, blackTime, onTimeOut, gameRef])
+  // last-remote values + timestamp used by non-owner tabs to interpolate
+  const lastRemoteAtRef = useRef(null)
+  const lastRemoteWhiteRef = useRef(null)
+  const lastRemoteBlackRef = useRef(null)
 
-  // keys per game to avoid cross-game interference
+  // persist refs when props change
+  useEffect(() => { onTimeOutRef.current = onTimeOut }, [onTimeOut])
+  useEffect(() => { gameRefRef.current = gameRef }, [gameRef])
+
+  // storage keys
   const prefix = `rc_${gameId}`
   const KEY_WHITE = `${prefix}_whiteTime`
   const KEY_BLACK = `${prefix}_blackTime`
   const KEY_CURRENT = `${prefix}_currentPlayer`
   const KEY_INITIAL = `${prefix}_initialMinutes`
 
-  // If another tab already set the initial minutes, reflect it in the setup UI immediately
+  // Tab identity (for basic owner election in local multi-tab mode)
+  const tabIdRef = useRef(null)
+  useEffect(() => {
+    let id = sessionStorage.getItem('rc_tab_id')
+    if (!id) {
+      id = Math.random().toString(36).slice(2)
+      sessionStorage.setItem('rc_tab_id', id)
+    }
+    tabIdRef.current = id
+  }, [])
+
+  // BroadcastChannel for fast cross-tab sync when available (local mode)
+  const channelRef = useRef(null)
   useEffect(() => {
     if (!isLocal) return
-    const stored = readMs(KEY_INITIAL)
-    if (stored != null) setTimeInput(stored)
-  }, [isLocal, KEY_INITIAL])
+    try {
+      if ('BroadcastChannel' in window) {
+        channelRef.current = new BroadcastChannel(`rc_channel_${gameId}`)
+        // Handle incoming broadcast messages (fast cross-tab sync)
+        channelRef.current.onmessage = (ev) => {
+          try {
+            const msg = ev.data
+            if (!msg) return
+            // tick message: update times and current player immediately
+            if (msg.type === 'tick' || msg.type === 'snapshot') {
+              const now = performance.now()
+              if (typeof msg.whiteTime === 'number') {
+                setWhiteTime(msg.whiteTime)
+                lastRemoteWhiteRef.current = msg.whiteTime
+              }
+              if (typeof msg.blackTime === 'number') {
+                setBlackTime(msg.blackTime)
+                lastRemoteBlackRef.current = msg.blackTime
+              }
+              if (msg.currentPlayer) setSyncedCurrent(msg.currentPlayer)
+              lastRemoteAtRef.current = now
+            }
+          } catch (e) {}
+        }
+      }
+    } catch (e) {
+      channelRef.current = null
+    }
 
-  // Initialize timers when game starts
+    return () => {
+      try { if (channelRef.current) channelRef.current.close() } catch (e) {}
+      channelRef.current = null
+    }
+  }, [isLocal, gameId])
+
+  // Initialize times when game starts (either from localStorage or Firebase or fallback)
   useEffect(() => {
     if (!gameStarted) return
 
-    // check if an initial minutes value was already persisted for this game
-    const storedInitial = readMs(KEY_INITIAL)
-    const minutesToUse = storedInitial != null ? storedInitial : (initialTimeMinutes || timeInput)
-    // initial time in ms (from prop, stored initial, or the timeInput state)
-    const initialMs = minutesToUse * 60 * 1000
+    const initialMs = Math.round((initialTimeMinutes || 5) * 60 * 1000)
 
     if (isLocal) {
-      // If other tab already created timers, pick them up
+      // read values from storage if present
       const w = readMs(KEY_WHITE)
       const b = readMs(KEY_BLACK)
       const cur = localStorage.getItem(KEY_CURRENT)
-
-      // If no stored initial exists but a prop initialTimeMinutes is provided, persist it
-      if (storedInitial == null && initialTimeMinutes) {
-        writeMs(KEY_INITIAL, initialTimeMinutes)
-      }
+      const storedInitial = readMs(KEY_INITIAL)
+      if (storedInitial == null) writeMs(KEY_INITIAL, initialTimeMinutes)
 
       if (w == null || b == null) {
-        // initialize storage for all tabs
         writeMs(KEY_WHITE, initialMs)
         writeMs(KEY_BLACK, initialMs)
-        // Default to White's turn when game starts (before first move)
-        const defaultPlayer = currentPlayer || 'w'
-        if (!cur) localStorage.setItem(KEY_CURRENT, defaultPlayer)
+        localStorage.setItem(KEY_CURRENT, currentPlayer || 'w')
         setWhiteTime(initialMs)
         setBlackTime(initialMs)
-        setSyncedCurrent(defaultPlayer)
+        setSyncedCurrent(currentPlayer || 'w')
+        lastRemoteWhiteRef.current = initialMs
+        lastRemoteBlackRef.current = initialMs
+        lastRemoteAtRef.current = performance.now()
       } else {
         setWhiteTime(w)
         setBlackTime(b)
         setSyncedCurrent(cur || currentPlayer || 'w')
+        lastRemoteWhiteRef.current = w
+        lastRemoteBlackRef.current = b
+        lastRemoteAtRef.current = performance.now()
       }
-
     } else {
-      // Non-local: initialize from Firebase or use default
-      const initializeFromFirebase = async () => {
-        if (gameRef) {
-          try {
-            const gameDoc = await gameRef.get()
-            const gameData = gameDoc.data()
-            if (gameData && (gameData.whiteTime != null || gameData.blackTime != null)) {
-              // Clock times already exist in Firebase, use them
-              setWhiteTime(gameData.whiteTime || initialMs)
-              setBlackTime(gameData.blackTime || initialMs)
-              setSyncedCurrent(gameData.currentPlayer || currentPlayer || 'w')
-            } else {
-              // Initialize clock times in Firebase
-              const defaultPlayer = currentPlayer || 'w'
-              setWhiteTime(initialMs)
-              setBlackTime(initialMs)
-              setSyncedCurrent(defaultPlayer)
-              await gameRef.update({
-                whiteTime: initialMs,
-                blackTime: initialMs,
-                currentPlayer: defaultPlayer
-              })
-            }
-          } catch (e) {
-            console.error('Failed to initialize from Firebase', e)
-            // Fallback to local state
-            const defaultPlayer = currentPlayer || 'w'
-            setWhiteTime(initialMs)
-            setBlackTime(initialMs)
-            setSyncedCurrent(defaultPlayer)
-          }
-        } else {
-          // No gameRef, use local state
-          const defaultPlayer = currentPlayer || 'w'
+      // remote: ask Firebase doc for existing times, else initialize it
+      const initRemote = async () => {
+        if (!gameRef) {
           setWhiteTime(initialMs)
           setBlackTime(initialMs)
-          setSyncedCurrent(defaultPlayer)
+          setSyncedCurrent(currentPlayer || 'w')
+          return
+        }
+        try {
+          const doc = await gameRef.get()
+          if (doc && doc.exists) {
+            const data = doc.data()
+            const wv = data.whiteTime != null ? data.whiteTime : initialMs
+            const bv = data.blackTime != null ? data.blackTime : initialMs
+            setWhiteTime(wv)
+            setBlackTime(bv)
+            setSyncedCurrent(data.currentPlayer || currentPlayer || 'w')
+            lastRemoteWhiteRef.current = wv
+            lastRemoteBlackRef.current = bv
+            lastRemoteAtRef.current = performance.now()
+          } else {
+            setWhiteTime(initialMs)
+            setBlackTime(initialMs)
+            setSyncedCurrent(currentPlayer || 'w')
+            lastRemoteWhiteRef.current = initialMs
+            lastRemoteBlackRef.current = initialMs
+            lastRemoteAtRef.current = performance.now()
+            await gameRef.update({ whiteTime: initialMs, blackTime: initialMs, currentPlayer: currentPlayer || 'w' })
+          }
+        } catch (e) {
+          console.error('ChessClock: firebase init failed', e)
+          setWhiteTime(initialMs)
+          setBlackTime(initialMs)
+          setSyncedCurrent(currentPlayer || 'w')
         }
       }
-      initializeFromFirebase()
+      initRemote()
     }
-  }, [gameStarted, initialTimeMinutes, gameId, gameRef])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gameStarted])
 
-  // Keep syncedCurrent in sync with incoming prop (non-local authoritative)
+  // Keep syncedCurrent in sync with incoming prop if provided
   useEffect(() => {
-    if (!isLocal) {
-      // For remote games, currentPlayer prop is authoritative
-      if (currentPlayer) {
-        setSyncedCurrent(currentPlayer)
-        // Update Firebase with current player
-        if (gameRef) {
-          gameRef.update({ currentPlayer }).catch(e => console.error('Failed to update currentPlayer', e))
-        }
-      } else {
-        // Default to White when game starts
-        const defaultPlayer = 'w'
-        setSyncedCurrent(defaultPlayer)
-        if (gameRef && gameStarted) {
-          gameRef.update({ currentPlayer: defaultPlayer }).catch(e => console.error('Failed to update currentPlayer', e))
-        }
-      }
-    } else if (currentPlayer) {
-      // if remote/local game logic reports a turn change, publish it to storage so other tabs pick up
-      try {
-        const stored = localStorage.getItem(KEY_CURRENT)
-        if (stored !== currentPlayer) {
-          localStorage.setItem(KEY_CURRENT, currentPlayer)
-          setSyncedCurrent(currentPlayer)
-        }
-      } catch (e) {}
-    }
-  }, [currentPlayer, isLocal, gameRef, gameStarted])
+    if (currentPlayer) setSyncedCurrent(currentPlayer)
+  }, [currentPlayer])
 
-  // Listen to storage events to sync between tabs (local only)
+  // Listen to localStorage changes (other tabs) when in local mode
   useEffect(() => {
     if (!isLocal) return
-    const handler = (e) => {
+    const onStorage = (e) => {
       if (!e.key) return
-      if (e.key === KEY_WHITE) {
-        const v = e.newValue ? parseInt(e.newValue, 10) : null
-        setWhiteTime(v)
-      }
-      if (e.key === KEY_BLACK) {
-        const v = e.newValue ? parseInt(e.newValue, 10) : null
-        setBlackTime(v)
-      }
-      if (e.key === KEY_CURRENT) {
-        setSyncedCurrent(e.newValue)
-      }
-      if (e.key === KEY_INITIAL) {
-        // if initial changes, we could re-init – ignore for now
-      }
+      if (e.key === KEY_WHITE) setWhiteTime(e.newValue ? parseInt(e.newValue, 10) : null)
+      if (e.key === KEY_BLACK) setBlackTime(e.newValue ? parseInt(e.newValue, 10) : null)
+      if (e.key === KEY_CURRENT) setSyncedCurrent(e.newValue)
+      // record remote-received values so non-owner can interpolate
+      try {
+        const now = performance.now()
+        if (e.key === KEY_WHITE && e.newValue) lastRemoteWhiteRef.current = parseInt(e.newValue, 10)
+        if (e.key === KEY_BLACK && e.newValue) lastRemoteBlackRef.current = parseInt(e.newValue, 10)
+        if (e.key === KEY_WHITE || e.key === KEY_BLACK) lastRemoteAtRef.current = now
+      } catch (err) {}
     }
-    window.addEventListener('storage', handler)
-    return () => window.removeEventListener('storage', handler)
-  }, [isLocal, KEY_WHITE, KEY_BLACK, KEY_CURRENT, KEY_INITIAL])
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [isLocal])
 
-  // Listen to Firebase updates for remote games (clock times and current player)
+  // Listen to Firebase snapshots to keep UI in sync with authoritative remote state
   useEffect(() => {
-    if (isLocal || !gameRef || !gameStarted) return
-
-    // Firebase v8 API: use .onSnapshot() on the document reference
-    const unsubscribe = gameRef.onSnapshot((doc) => {
-      if (!doc.exists) return
-      const gameData = doc.data()
-      
-      // Update clock times from Firebase (only if they differ significantly to avoid unnecessary updates)
-      if (gameData.whiteTime != null) {
-        setWhiteTime(prev => {
-          // Only update if the difference is significant (more than 500ms) to avoid flicker
-          const diff = Math.abs((prev || 0) - gameData.whiteTime)
-          return diff > 500 ? gameData.whiteTime : prev
-        })
-      }
-      if (gameData.blackTime != null) {
-        setBlackTime(prev => {
-          // Only update if the difference is significant (more than 500ms) to avoid flicker
-          const diff = Math.abs((prev || 0) - gameData.blackTime)
-          return diff > 500 ? gameData.blackTime : prev
-        })
-      }
-      
-      // Update current player from Firebase
-      if (gameData.currentPlayer && gameData.currentPlayer !== syncedCurrent) {
-        setSyncedCurrent(gameData.currentPlayer)
-      }
-    }, (error) => {
-      console.error('Firebase snapshot error:', error)
-    })
-
-    return () => unsubscribe()
-  }, [isLocal, gameRef, gameStarted, syncedCurrent])
-
-  // When syncedCurrent changes, start/stop the running interval depending on whether this tab should run
-  useEffect(() => {
-    // clear any previous interval
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current)
-      intervalRef.current = null
+    if (!gameRef || isLocal) return
+    let unsub = null
+    try {
+      unsub = gameRef.onSnapshot(doc => {
+        if (!doc.exists) return
+        const d = doc.data()
+        // Immediately apply authoritative times from server and record timestamp so
+        // non-owner clients can locally interpolate the ticking clock between updates.
+        if (d.whiteTime != null) {
+          setWhiteTime(d.whiteTime)
+          lastRemoteWhiteRef.current = d.whiteTime
+        }
+        if (d.blackTime != null) {
+          setBlackTime(d.blackTime)
+          lastRemoteBlackRef.current = d.blackTime
+        }
+        if (d.currentPlayer && d.currentPlayer !== syncedCurrent) setSyncedCurrent(d.currentPlayer)
+        lastRemoteAtRef.current = performance.now()
+        // broadcast snapshot to other local tabs for immediate UI sync (if available)
+        try {
+          if (isLocal && channelRef.current) channelRef.current.postMessage({ type: 'snapshot', whiteTime: d.whiteTime, blackTime: d.blackTime, currentPlayer: d.currentPlayer })
+        } catch (e) {}
+      }, err => console.error('ChessClock snapshot err', err))
+    } catch (e) {
+      console.error('ChessClock: snapshot subscribe failed', e)
     }
+    return () => { if (unsub) unsub() }
+  }, [gameRef, isLocal])
 
-    if (isGameOver) {
-      // Stop both clocks when game is over
+  // optimistic local turn flip handler (Game.js can dispatch a move-made event for snappy UI)
+  useEffect(() => {
+    const handler = (e) => {
+      try {
+        const nx = e && e.detail && e.detail.currentPlayer
+        if (nx) setSyncedCurrent(nx)
+      } catch (e) {}
+    }
+    window.addEventListener('move-made', handler)
+    return () => window.removeEventListener('move-made', handler)
+  }, [])
+
+  // determine whether THIS client should run the ticking loop
+  // - if `localPlayer` is set, only that player client should tick when it's their turn
+  // - otherwise, in local multi-tab mode we elect a basic owner tab to avoid duplicate ticking
+  const amOwnerRef = useRef(false)
+  useEffect(() => {
+    if (localPlayer) {
+      amOwnerRef.current = true // this client is a player and is allowed to tick its side when active
       return
     }
+    if (!isLocal) {
+      amOwnerRef.current = false
+      return
+    }
+    // basic local owner election: first tab to set owner key becomes owner
+    const ownerKey = `${prefix}_owner`
+    const tabId = tabIdRef.current
+    try {
+      const owner = localStorage.getItem(ownerKey)
+      if (!owner) localStorage.setItem(ownerKey, tabId)
+      amOwnerRef.current = (localStorage.getItem(ownerKey) === tabId)
+    } catch (e) {
+      amOwnerRef.current = true // fallback: allow ticking
+    }
+    // try to release ownership on unload (best effort)
+    const onUnload = () => {
+      try {
+        const curr = localStorage.getItem(ownerKey)
+        if (curr === tabId) localStorage.removeItem(ownerKey)
+      } catch (e) {}
+    }
+    window.addEventListener('beforeunload', onUnload)
+    return () => window.removeEventListener('beforeunload', onUnload)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLocal, localPlayer, gameId])
 
-    // For local games: only run timer if it's the local player's turn
-    // For remote games: run timer if it's any player's turn (we'll sync via Firebase)
-    const shouldRunBase = isLocal ? (localPlayer && syncedCurrent === localPlayer) : (syncedCurrent === 'w' || syncedCurrent === 'b')
-    const shouldRun = gameStarted && shouldRunBase
+  // Core ticking loop using requestAnimationFrame + elapsed delta
+  useEffect(() => {
+    // stop if game not running
+    if (!gameStarted || isGameOver) return
 
-    if (shouldRun) {
-      // Store the current player for the interval closure
-      const activePlayer = syncedCurrent
-      
-      intervalRef.current = setInterval(() => {
-        // Use refs to access latest values without recreating interval
-        const currentWhite = whiteTimeRef.current
-        const currentBlack = blackTimeRef.current
-        const currentGameRef = gameRefRef.current
-        const currentOnTimeOut = onTimeOutRef.current
-        
-        // decrement the correct clock
-        if (isLocal) {
-          // read latest from storage to avoid drift
-          const wNow = readMs(KEY_WHITE)
-          const bNow = readMs(KEY_BLACK)
-          // pick current values
-          let w = wNow != null ? wNow : (currentWhite != null ? currentWhite : 0)
-          let b = bNow != null ? bNow : (currentBlack != null ? currentBlack : 0)
+    // cancel existing loop
+    if (rafRef.current) cancelAnimationFrame(rafRef.current)
 
-          if (localPlayer === 'w' && activePlayer === 'w') {
-            w = w - 1000
-            if (w <= 0) {
-              writeMs(KEY_WHITE, 0)
-              setWhiteTime(0)
-              // Stop both clocks on timeout
-              if (intervalRef.current) {
-                clearInterval(intervalRef.current)
-                intervalRef.current = null
-              }
-              if (currentOnTimeOut) currentOnTimeOut('white')
-              return
+    lastTsRef.current = performance.now()
+    lastSyncRef.current = performance.now()
+
+    const tick = (now) => {
+      const last = lastTsRef.current || now
+      const dt = Math.max(0, now - last)
+      lastTsRef.current = now
+
+      // only the owning client should decrement the active clock
+      const active = syncedCurrent // 'w' or 'b'
+      const canRun = amOwnerRef.current && (!localPlayer || syncedCurrent === localPlayer)
+
+  if (canRun) {
+        // read current values (prefer refs if available)
+        const w = whiteRef.current != null ? whiteRef.current : (readMs(KEY_WHITE) || 0)
+        const b = blackRef.current != null ? blackRef.current : (readMs(KEY_BLACK) || 0)
+
+        if (active === 'w') {
+          const next = Math.max(0, w - dt)
+          whiteRef.current = next
+          setWhiteTime(next)
+          // sync periodically
+          if (now - lastSyncRef.current >= SYNC_INTERVAL) {
+            lastSyncRef.current = now
+            if (isLocal) {
+              writeMs(KEY_WHITE, next)
+              try { if (channelRef.current) channelRef.current.postMessage({ type: 'tick', whiteTime: next, blackTime: blackRef.current || readMs(KEY_BLACK), currentPlayer: syncedCurrent }) } catch (e) {}
+            } else if (gameRefRef.current) {
+              gameRefRef.current.update({ whiteTime: next }).catch(e => console.error(e))
             }
-            writeMs(KEY_WHITE, w)
-            setWhiteTime(w)
-          } else if (localPlayer === 'b' && activePlayer === 'b') {
-            b = b - 1000
-            if (b <= 0) {
-              writeMs(KEY_BLACK, 0)
-              setBlackTime(0)
-              // Stop both clocks on timeout
-              if (intervalRef.current) {
-                clearInterval(intervalRef.current)
-                intervalRef.current = null
-              }
-              if (currentOnTimeOut) currentOnTimeOut('black')
-              return
+            if (next <= 0) {
+              try { onTimeOutRef.current('w') } catch (e) {}
             }
-            writeMs(KEY_BLACK, b)
-            setBlackTime(b)
           }
-        } else {
-          // Remote game: update local state and sync to Firebase
-          if (activePlayer === 'w') {
-            const currentTime = currentWhite != null ? currentWhite : 0
-            const next = currentTime - 1000
-            if (next <= 0) {
-              // Stop both clocks on timeout
-              if (intervalRef.current) {
-                clearInterval(intervalRef.current)
-                intervalRef.current = null
-              }
-              // Update Firebase to stop clocks
-              if (currentGameRef) {
-                currentGameRef.update({ whiteTime: 0, currentPlayer: null }).catch(e => console.error('Failed to update timeout', e))
-              }
-              setWhiteTime(0)
-              if (currentOnTimeOut) currentOnTimeOut('white')
-            } else {
-              setWhiteTime(next)
-              // Update Firebase with new time every second
-              if (currentGameRef) {
-                currentGameRef.update({ whiteTime: next }).catch(e => console.error('Failed to update whiteTime', e))
-              }
+        } else if (active === 'b') {
+          const next = Math.max(0, b - dt)
+          blackRef.current = next
+          setBlackTime(next)
+          if (now - lastSyncRef.current >= SYNC_INTERVAL) {
+            lastSyncRef.current = now
+            if (isLocal) {
+              writeMs(KEY_BLACK, next)
+              try { if (channelRef.current) channelRef.current.postMessage({ type: 'tick', whiteTime: whiteRef.current || readMs(KEY_WHITE), blackTime: next, currentPlayer: syncedCurrent }) } catch (e) {}
+            } else if (gameRefRef.current) {
+              gameRefRef.current.update({ blackTime: next }).catch(e => console.error(e))
             }
-          } else if (activePlayer === 'b') {
-            const currentTime = currentBlack != null ? currentBlack : 0
-            const next = currentTime - 1000
             if (next <= 0) {
-              // Stop both clocks on timeout
-              if (intervalRef.current) {
-                clearInterval(intervalRef.current)
-                intervalRef.current = null
-              }
-              // Update Firebase to stop clocks
-              if (currentGameRef) {
-                currentGameRef.update({ blackTime: 0, currentPlayer: null }).catch(e => console.error('Failed to update timeout', e))
-              }
-              setBlackTime(0)
-              if (currentOnTimeOut) currentOnTimeOut('black')
-            } else {
-              setBlackTime(next)
-              // Update Firebase with new time every second
-              if (currentGameRef) {
-                currentGameRef.update({ blackTime: next }).catch(e => console.error('Failed to update blackTime', e))
-              }
+              try { onTimeOutRef.current('b') } catch (e) {}
             }
           }
         }
-      }, 1000)
+      }
+      else {
+        // Non-owner interpolation: locally display the active player's clock decreasing
+        // between authoritative updates. We don't write back to storage/Firestore here.
+        try {
+          const lastAt = lastRemoteAtRef.current || now
+          const age = Math.max(0, now - lastAt)
+          if (syncedCurrent === 'w') {
+            const base = lastRemoteWhiteRef.current != null ? lastRemoteWhiteRef.current : (whiteRef.current != null ? whiteRef.current : (readMs(KEY_WHITE) || 0))
+            const display = Math.max(0, base - age)
+            setWhiteTime(display)
+          } else if (syncedCurrent === 'b') {
+            const base = lastRemoteBlackRef.current != null ? lastRemoteBlackRef.current : (blackRef.current != null ? blackRef.current : (readMs(KEY_BLACK) || 0))
+            const display = Math.max(0, base - age)
+            setBlackTime(display)
+          }
+        } catch (e) {}
+      }
+
+      rafRef.current = requestAnimationFrame(tick)
     }
+
+    rafRef.current = requestAnimationFrame(tick)
 
     return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current)
-        intervalRef.current = null
-      }
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+      rafRef.current = null
     }
-    // Remove whiteTime and blackTime from dependencies - we use refs instead
-    // Only recreate interval when syncedCurrent, gameStarted, or isGameOver changes
-  }, [syncedCurrent, isLocal, localPlayer, isGameOver, gameStarted])
+    // We deliberately exclude many dependencies; we use refs for live values.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gameStarted, isGameOver, syncedCurrent])
 
-  // Format time for display (mm:ss)
-  const formatTime = (timeInMs) => {
-    if (timeInMs === null) return '--:--'
-    const totalSeconds = Math.floor(timeInMs / 1000)
-    const minutes = Math.floor(totalSeconds / 60)
-    const seconds = totalSeconds % 60
-    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+  // keep refs in sync with state for read access inside rAF loop
+  useEffect(() => { whiteRef.current = whiteTime }, [whiteTime])
+  useEffect(() => { blackRef.current = blackTime }, [blackTime])
+
+  // formatting helper
+  const format = (ms) => {
+    if (ms == null) return '--:--'
+    const s = Math.floor(ms / 1000)
+    const m = Math.floor(s / 60)
+    const sec = s % 60
+    return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
   }
 
-  // Predefined time options UI (unchanged)
-  const timePresets = [1, 3, 5, 10, 15, 30]
+  // display order based on perspective prop
+  const topColor = perspective === 'white' ? 'b' : 'w'
+  const bottomColor = perspective === 'white' ? 'w' : 'b'
 
-  // Time setup UI (only shown if game not started AND this tab/player can set initial AND no initial persisted)
+  const displayFor = (color) => color === 'w' ? (whiteTime != null ? whiteTime : readMs(KEY_WHITE)) : (blackTime != null ? blackTime : readMs(KEY_BLACK))
+
+  const topTime = displayFor(topColor)
+  const bottomTime = displayFor(bottomColor)
+
+  const isLow = (t) => t != null && t <= LOW_TIME_THRESHOLD
+
+  // Pre-start UI: allow choosing initial time (this preserves the earlier behaviour)
   if (!gameStarted) {
     const storedInitial = isLocal ? readMs(KEY_INITIAL) : null
     const initialPresent = storedInitial != null || initialTimeMinutes != null
     if (canSetInitial && !initialPresent) {
+      const presets = [1, 3, 5, 10, 15, 30]
       return (
         <div className="chess-clock-setup">
           <h3>Select Time Control</h3>
           <div className="time-presets">
-            {timePresets.map(mins => (
-              <button
-                key={mins}
-                className={`time-preset-btn ${timeInput === mins ? 'selected' : ''}`}
-                onClick={() => {
-                  setTimeInput(mins)
-                  if (isLocal) writeMs(KEY_INITIAL, mins)
-                  if (onSetInitial) onSetInitial(mins)
-                }}
-              >
-                {mins} min
-              </button>
+            {presets.map(p => (
+              <button key={p} onClick={() => { if (isLocal) writeMs(KEY_INITIAL, p); if (onSetInitial) onSetInitial(p) }}>{p} min</button>
             ))}
-          </div>
-          <div className="custom-time">
-            <label>
-              Custom time (1-60 min):
-              <input
-                type="number"
-                min="1"
-                max="60"
-                value={timeInput || ''}
-                onChange={(e) => {
-                  const v = Math.max(1, Math.min(60, parseInt(e.target.value) || 1))
-                  setTimeInput(v)
-                  if (isLocal) writeMs(KEY_INITIAL, v)
-                  if (onSetInitial) onSetInitial(v)
-                }}
-              />
-            </label>
           </div>
         </div>
       )
     }
-    // else: initial already present or this tab cannot set — show static clocks with initial time (paused)
-    const displayWhiteStatic = storedInitial != null ? storedInitial * 60 * 1000 : (initialTimeMinutes != null ? initialTimeMinutes * 60 * 1000 : (whiteTime || null))
-    const displayBlackStatic = storedInitial != null ? storedInitial * 60 * 1000 : (initialTimeMinutes != null ? initialTimeMinutes * 60 * 1000 : (blackTime || null))
+
+    // default static display prior to game start
+    const dispWhite = storedInitial != null ? storedInitial * 60 * 1000 : (initialTimeMinutes != null ? initialTimeMinutes * 60 * 1000 : (whiteTime || '--'))
+    const dispBlack = storedInitial != null ? storedInitial * 60 * 1000 : (initialTimeMinutes != null ? initialTimeMinutes * 60 * 1000 : (blackTime || '--'))
     return (
       <>
-        <div className={`chess-clock black ${syncedCurrent === 'b' ? 'active' : ''}`} aria-label="Black clock">
-          {formatTime(displayBlackStatic)}
-        </div>
-        <div className={`chess-clock white ${syncedCurrent === 'w' ? 'active' : ''}`} aria-label="White clock">
-          {formatTime(displayWhiteStatic)}
-        </div>
+        <div className={`chess-clock ${topColor === 'w' ? 'white' : 'black'}`} aria-label={`${topColor === 'w' ? 'White' : 'Black'} clock`}>{format(topColor === 'w' ? dispWhite : dispBlack)}</div>
+        <div className={`chess-clock ${bottomColor === 'w' ? 'white' : 'black'}`} aria-label={`${bottomColor === 'w' ? 'White' : 'Black'} clock`}>{format(bottomColor === 'w' ? dispWhite : dispBlack)}</div>
       </>
     )
   }
 
-  const isLowTime = (time) => time !== null && time <= 30000
-
-  // When not local, we still may want to show the clock values
-  const displayWhite = isLocal ? (whiteTime != null ? whiteTime : readMs(KEY_WHITE)) : whiteTime
-  const displayBlack = isLocal ? (blackTime != null ? blackTime : readMs(KEY_BLACK)) : blackTime
-
+  // Running display
   return (
     <>
-      <div
-        className={`chess-clock black ${syncedCurrent === 'b' ? 'active' : ''} ${isLowTime(displayBlack) ? 'low-time' : ''}`}
-        aria-label="Black clock"
-      >
-        {formatTime(displayBlack)}
-      </div>
-      <div
-        className={`chess-clock white ${syncedCurrent === 'w' ? 'active' : ''} ${isLowTime(displayWhite) ? 'low-time' : ''}`}
-        aria-label="White clock"
-      >
-        {formatTime(displayWhite)}
-      </div>
+      <div className={`chess-clock ${topColor === 'w' ? 'white' : 'black'} ${syncedCurrent === topColor ? 'active' : ''} ${isLow(topTime) ? 'low-time' : ''}`} aria-label={`${topColor} clock`}>{format(topTime)}</div>
+      <div className={`chess-clock ${bottomColor === 'w' ? 'white' : 'black'} ${syncedCurrent === bottomColor ? 'active' : ''} ${isLow(bottomTime) ? 'low-time' : ''}`} aria-label={`${bottomColor} clock`}>{format(bottomTime)}</div>
+      {(topTime === 0 || bottomTime === 0) && (
+        <div className="time-over">{topTime === 0 ? `${topColor === 'w' ? 'White' : 'Black'} ran out of time` : `${bottomColor === 'w' ? 'White' : 'Black'} ran out of time`}</div>
+      )}
     </>
   )
 }
-
-export default ChessClock

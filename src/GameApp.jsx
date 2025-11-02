@@ -3,6 +3,7 @@ import './App.css'
 import { gameSubject, initGame, resetGame, endGameByTimeout } from './Game'
 import Board from './Board'
 import ChessClock from './ChessClock'
+import GameEndPopup from './components/GameEndPopup'
 import { useParams, useHistory, useLocation } from 'react-router-dom'
 import { db } from './firebase'
 
@@ -10,6 +11,8 @@ function GameApp() {
   const [board, setBoard] = useState([])
   const [isGameOver, setIsGameOver] = useState()
   const [result, setResult] = useState()
+  const [popupOpen, setPopupOpen] = useState(false)
+  const [popupMessage, setPopupMessage] = useState(null)
   const [position, setPosition] = useState()
   const [initResult, setInitResult] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -40,9 +43,32 @@ function GameApp() {
         setMoveHistory([])
         lastProcessedMoveRef.current = null
         subscribe = gameSubject.subscribe((game) => {
+          console.debug('GameApp: received game update', game)
           setBoard(game.board)
           setIsGameOver(game.isGameOver)
           setResult(game.result)
+          // If server reports game over, show friendly popup message
+          if (game.isGameOver && game.result) {
+            const mapResult = (r) => {
+              try {
+                const up = String(r).toUpperCase()
+                if (up.includes('CHECKMATE')) {
+                  if (up.includes('BLACK')) return 'Black wins by checkmate'
+                  if (up.includes('WHITE')) return 'White wins by checkmate'
+                }
+                if (up.includes('TIMEOUT') || up.includes('TIME -') || up.includes('TIMEOUT -')) {
+                  if (up.includes('BLACK')) return 'Black wins on time'
+                  if (up.includes('WHITE')) return 'White wins on time'
+                }
+                if (up.includes('DRAW')) return 'Draw'
+                return r
+              } catch (e) { return r }
+            }
+            const friendly = mapResult(game.result)
+            setPopupMessage(friendly)
+            setPopupOpen(true)
+            setResult(friendly)
+          }
           setPosition(game.position)
           setStatus(game.status)
           setGame(game)
@@ -100,9 +126,15 @@ function GameApp() {
   // MUST be called before any early returns (Rules of Hooks)
   const handleTimeOut = useCallback((player) => {
     // Stop both clocks and end game
-    endGameByTimeout(player)
+    // normalize player input ('w'|'b' or 'white'|'black')
+    const loser = (player === 'w' || player === 'white') ? 'white' : (player === 'b' || player === 'black') ? 'black' : player
+    endGameByTimeout(loser)
     setIsGameOver(true)
-    setResult(`Time over! ${player === 'white' ? 'Black' : 'White'} wins!`)
+    const winner = loser === 'white' ? 'White' : 'Black'
+    const msg = `${winner} wins on time`
+    setResult(msg)
+    setPopupMessage(msg)
+    setPopupOpen(true)
   }, [])
 
   // Memoize onSetInitial callback
@@ -217,6 +249,9 @@ function GameApp() {
                 onTimeOut={handleTimeOut}
                 isLocal={id === 'local'}
                 localPlayer={position}
+                // perspective controls which color is shown at the bottom of the UI
+                // pass 'white' when this client plays White, 'black' when plays Black
+                perspective={position === 'b' ? 'black' : 'white'}
                 // prefer persisted game.initialMinutes, then query param
                 initialTimeMinutes={game.initialMinutes != null ? game.initialMinutes : initialTimeMinutes}
                 gameId={id || 'local'}
@@ -241,6 +276,18 @@ function GameApp() {
               <button className="button is-info" onClick={copyToClipboard}>Copy</button>
             </div>
           </div>
+          <GameEndPopup
+            open={popupOpen}
+            message={popupMessage || result}
+            onClose={() => setPopupOpen(false)}
+            onNewGame={async () => {
+              await resetGame()
+              setMoveHistory([])
+              lastProcessedMoveRef.current = null
+              setPopupOpen(false)
+              history.push('/')
+            }}
+          />
         </div>
       )}
 

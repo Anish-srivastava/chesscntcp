@@ -6,12 +6,14 @@ import "firebase/auth";
 //json string like here https://create-react-app.dev/docs/adding-custom-environment-variables/
 
 const config = {
-  apiKey: "AIzaSyDcmYOE14GFGx45gRxj1ROB71JlPJ-ZaSM",
-  authDomain: "react-chess-27971.firebaseapp.com",
-  projectId: "react-chess-27971",
-  storageBucket: "react-chess-27971.appspot.com",
-  messagingSenderId: "73289217526",
-  appId: "1:73289217526:web:9e93c9979bca8ee3f203d7",
+
+  apiKey: "AIzaSyDBIzHwrLiGJrHhQMEb_OfPe-GIj80177U",
+  authDomain: "react-chess-p.firebaseapp.com",
+  projectId: "react-chess-p",
+  storageBucket: "react-chess-p.firebasestorage.app",
+  messagingSenderId: "558131771571",
+  appId: "1:558131771571:web:a273d889b5db82d3d858c6",
+  measurementId: "G-D4R1SS7YK1"
 };
 
 const firebaseConfig = config;

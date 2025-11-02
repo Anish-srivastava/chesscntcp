@@ -41,23 +41,45 @@ export async function initGame(gameRefFb) {
         gameSubject = fromDocRef(gameRefFb).pipe(
             map(gameDoc => {
                 const game = gameDoc.data()
-                const { pendingPromotion, gameData, ...restOfGame } = game
+                const { pendingPromotion, gameData, lastMove: remotelastMove, ...restOfGame } = game
                 member = game.members.find(m => m.uid === currentUser.uid)
-                const oponent = game.members.find(m => m.uid !== currentUser.uid)
+                const opponent = game.members.find(m => m.uid !== currentUser.uid)
+
+                // Validate and load game state
                 if (gameData) {
-                    chess.load(gameData)
+                    try {
+                        // chess.load(fen) returns true/false depending on validity in this build.
+                        // The library export may not expose a standalone validate_fen function
+                        // (different chess.js builds differ). Use chess.load and handle failure.
+                        const ok = chess.load(gameData)
+                        if (!ok) {
+                            console.error('Invalid FEN received (chess.load returned false):', gameData)
+                            // Potentially implement recovery logic here
+                        }
+                    } catch (error) {
+                        console.error('Error loading game state:', error)
+                    }
                 }
+
+                // Handle remote moves
+                if (remotelastMove && remotelastMove.timestamp > (lastMove?.timestamp || 0)) {
+                    lastMove = remotelastMove // Update local last move
+                }
+
                 const isGameOver = chess.game_over()
+                
                 return {
                     board: chess.board(),
                     pendingPromotion,
                     isGameOver,
                     position: member.piece,
-                        currentPlayer: chess.turn(),
-                        member,
-                        oponent,
-                        result: isGameOver ? getGameResult() : null,
-                        ...restOfGame
+                    currentPlayer: chess.turn(),
+                    member,
+                    opponent, // Fixed typo in variable name
+                    lastMove,
+                    moveCount: chess.history().length,
+                    result: isGameOver ? getGameResult() : null,
+                    ...restOfGame
                 }
             })
         )
@@ -101,62 +123,145 @@ export function handleMove(from, to) {
 
 
 export function move(from, to, promotion) {
-    // prevent moves after an external game over (e.g., timeout)
+    // Prevent moves after game over
     if (externalGameOver || chess.game_over()) return
+
+    // Construct move object
     let tempMove = { from, to }
     if (promotion) {
         tempMove.promotion = promotion
     }
-    console.log({ tempMove, member }, chess.turn())
+
     if (gameRef) {
+        // Online multiplayer game
         if (member.piece === chess.turn()) {
             const legalMove = chess.move(tempMove)
             if (legalMove) {
-                // save lastMove so UI can display it
-                lastMove = legalMove
+                // Save move details for animation and highlighting
+                lastMove = {
+                    ...legalMove,
+                    timestamp: Date.now(),  // For move timing
+                    player: member.piece    // Track who made the move
+                }
+                
+                // Immediately update local state for responsive UI
+                const currentState = {
+                    board: chess.board(),
+                    lastMove,
+                    currentPlayer: chess.turn(),
+                    moveCount: chess.history().length,
+                    fen: chess.fen()
+                }
+                
+                // Notify local subscribers immediately
+                // If gameSubject is a Subject (local mode) notify subscribers immediately for snappy UI.
+                // In remote mode gameSubject is an Observable from Firestore and does not support .next().
+                if (gameSubject && typeof gameSubject.next === 'function') {
+                    try {
+                        gameSubject.next({
+                            ...currentState,
+                            pendingPromotion: null,
+                            isGameOver: chess.game_over(),
+                            position: member.piece,
+                            member,
+                            result: chess.game_over() ? getGameResult() : null
+                        })
+                    } catch (e) {
+                        // swallow errors from optimistic publish; Firestore update will be authoritative
+                        console.warn('gameSubject.next failed (likely remote Observable):', e)
+                    }
+                }
+
+                // Then update Firebase (this will trigger updates for other players)
+                // Dispatch a lightweight event so local UI components (clocks) can react immediately
+                // before the remote snapshot arrives. This avoids a visible delay where the
+                // mover's clock keeps running until Firestore round-trip completes.
+                try {
+                    window.dispatchEvent(new CustomEvent('move-made', { detail: { currentPlayer: chess.turn(), lastMove } }))
+                } catch (e) {}
                 updateGame()
             }
         }
     } else {
+        // Local game mode
         const legalMove = chess.move(tempMove)
-
         if (legalMove) {
-            // save lastMove for local mode
-            lastMove = legalMove
+            lastMove = {
+                ...legalMove,
+                timestamp: Date.now(),
+                player: chess.turn() === 'w' ? 'b' : 'w' // Previous player
+            }
             updateGame()
         }
     }
-
 }
 
 async function updateGame(pendingPromotion, reset) {
     const isGameOver = chess.game_over()
+    
     if (gameRef) {
-        const updatedData = { gameData: chess.fen(), pendingPromotion: pendingPromotion || null, currentPlayer: chess.turn() }
-        console.log({ updateGame })
+        // Online multiplayer game
+        const updatedData = {
+            gameData: chess.fen(),
+            pendingPromotion: pendingPromotion || null,
+            currentPlayer: chess.turn(),
+            moveCount: chess.history().length,
+            updatedAt: Date.now() // For synchronization
+        }
+
         if (reset) {
             updatedData.status = 'over'
         }
-        // include lastMove in the remote game document so subscribers can pick it up
+
         if (lastMove) {
-            updatedData.lastMove = lastMove
+            // Include detailed move information
+            updatedData.lastMove = {
+                ...lastMove,
+                fen: chess.fen(), // Include full position for validation
+                moveNumber: chess.history().length
+            }
         }
-        await gameRef.update(updatedData)
-        // clear lastMove after publishing
-        lastMove = null
+
+        try {
+            // Batch update to ensure atomic operation
+            console.log('updateGame: writing to Firestore', updatedData)
+            await gameRef.update(updatedData)
+            console.log('updateGame: write successful')
+            
+            // Verify the move was recorded
+            const snapshot = await gameRef.get()
+            const currentData = snapshot.data()
+            
+            if (currentData.moveCount !== updatedData.moveCount) {
+                // Move wasn't recorded properly, try to recover
+                console.warn('Move sync issue detected, resyncing...')
+                await gameRef.update({
+                    gameData: chess.fen(),
+                    currentPlayer: chess.turn(),
+                    moveCount: chess.history().length
+                })
+            }
+        } catch (error) {
+            console.error('Failed to update game:', error)
+            // Optionally implement retry logic here
+        }
+
+        lastMove = null // Clear after successful sync
     } else {
+        // Local game mode
         const newGame = {
             board: chess.board(),
             pendingPromotion,
             isGameOver,
-                position: chess.turn(),
-                currentPlayer: chess.turn(),
+            position: chess.turn(),
+            currentPlayer: chess.turn(),
             result: isGameOver ? getGameResult() : null,
-            lastMove: lastMove || null
+            lastMove: lastMove || null,
+            moveCount: chess.history().length
         }
+        
         localStorage.setItem('savedGame', chess.fen())
         gameSubject.next(newGame)
-        // clear lastMove for local
         lastMove = null
     }
 
