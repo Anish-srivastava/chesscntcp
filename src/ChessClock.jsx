@@ -433,14 +433,41 @@ export default function ChessClock({
     const storedInitial = isLocal ? readMs(KEY_INITIAL) : null
     const initialPresent = storedInitial != null || initialTimeMinutes != null
     if (canSetInitial && !initialPresent) {
-      const presets = [1, 3, 5, 10, 15, 30]
+      const presets = [3, 5, 15, 30]
       return (
         <div className="chess-clock-setup">
           <h3>Select Time Control</h3>
           <div className="time-presets">
             {presets.map(p => (
-              <button key={p} onClick={() => { if (isLocal) writeMs(KEY_INITIAL, p); if (onSetInitial) onSetInitial(p) }}>{p} min</button>
+              <button key={p} className="time-preset-btn" onClick={() => { if (isLocal) writeMs(KEY_INITIAL, p); if (onSetInitial) onSetInitial(p) }}>{p} min</button>
             ))}
+          </div>
+          <div className="custom-time">
+            <label>Custom (min):</label>
+            <input 
+              type="number" 
+              min="1" 
+              max="180" 
+              defaultValue="10"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  const value = parseInt(e.target.value) || 10;
+                  if (isLocal) writeMs(KEY_INITIAL, value);
+                  if (onSetInitial) onSetInitial(value);
+                }
+              }}
+            />
+            <button 
+              className="custom-btn"
+              onClick={(e) => {
+                const input = e.target.parentElement.querySelector('input');
+                const value = parseInt(input.value) || 10;
+                if (isLocal) writeMs(KEY_INITIAL, value);
+                if (onSetInitial) onSetInitial(value);
+              }}
+            >
+              Set
+            </button>
           </div>
         </div>
       )
